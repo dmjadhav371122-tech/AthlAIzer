@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [react()],
   
   // --- ADD THIS LINE ---
-  base: '/AthlAIzer/',
+  base: './',
   // --------------------
 
   optimizeDeps: {
