@@ -1,0 +1,55 @@
+# This is the code for: .github/workflows/deploy.yml
+
+name: Deploy Vite App to GitHub Pages
+
+on:
+  # Runs on pushes to the "main" branch
+  push:
+    branches: [ main ]
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# Allow this job to clone the repo and create a page deployment
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18 # Use a stable LTS version
+      
+      - name: Install dependencies
+        run: npm install
+      
+      - name: Build project
+        # This is where it uses your secrets!
+        run: npm run build
+        env:
+          VITE_BOLT_DATABASE_URL: ${{ secrets.VITE_BOLT_DATABASE_URL }}
+          VITE_BOLT_DATABASE_ANON_KEY: ${{ secrets.VITE_BOLT_DATABASE_ANON_KEY }}
+          
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./dist # The folder Vite builds to
+
+  deploy:
+    # This job needs the "build" job to finish first
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
