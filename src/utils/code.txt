@@ -1,0 +1,736 @@
+from ultralytics import YOLO
+import cv2
+import yaml
+import numpy as np
+import sys
+import math
+import pandas as pd  # <-- Import pandas for Excel functionality
+
+# --- Helper functions ---
+
+def get_team_roster(team_name, existing_roster=None):
+    """
+    Prompts the user to enter a comma-separated list of jersey numbers.
+    NEW: Automatically adds 'A' suffix to duplicates found in existing_roster.
+    """
+    if existing_roster is None:
+        existing_roster = set()
+
+    while True:
+        try:
+            prompt = f"Enter comma-separated jersey numbers for the '{team_name}' team (e.g., '10,15,22,99'): "
+            jn_list_str = input(prompt)
+
+            jn_set = set()
+            raw_nums = [num.strip() for num in jn_list_str.split(',') if num.strip()]
+
+            if not raw_nums:
+                print("No numbers entered. Please try again.")
+                continue
+
+            for num in raw_nums:
+                if num in existing_roster:
+                    new_num = f"{num}A"
+                    jn_set.add(new_num)
+                    print(f"ℹ Info: Duplicate number '{num}' found. Saving as '{new_num}' for {team_name}.")
+                else:
+                    jn_set.add(num)
+
+            print(f"✅ {team_name} roster loaded with {len(jn_set)} players: {jn_set}")
+            return jn_set
+
+        except Exception as e:
+            print(f"Invalid input: {e}. Please try again.")
+
+# *** NEW HELPER FUNCTION: Get Float Value ***
+def get_user_float(prompt_message, default_value):
+    """
+    Prompts the user to enter a float value.
+    Returns the default value if input is empty or invalid.
+    """
+    try:
+        # Ask the user for input, showing the default
+        user_input = input(f"{prompt_message} [Default: {default_value}]: ")
+        user_input = user_input.strip()
+        
+        if not user_input:
+            # User just pressed Enter
+            print(f"ℹ Info: No input. Using default value: {default_value}")
+            return default_value
+            
+        # Try to convert the input to a float
+        val = float(user_input)
+        print(f"✅ Set value to: {val}")
+        return val
+        
+    except ValueError:
+        # User entered something that isn't a number (e.g., 'abc')
+        print(f"⚠ Invalid input. '{user_input}' is not a valid number. Using default: {default_value}")
+        return default_value
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}. Using default: {default_value}")
+        return default_value
+# --- *** END OF NEW HELPER FUNCTION *** ---
+
+# --- *** CORRECTED IOU FUNCTION *** ---
+def iou(box1, box2):
+    """Calculates the Intersection over Union (IoU) of two bounding boxes."""
+    # box format: [x1, y1, x2, y2]
+    x_left, y_top = max(box1[0], box2[0]), max(box1[1], box2[1])
+    x_right, y_bottom = min(box1[2], box2[2]), min(box1[3], box2[3])
+
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+
+    # --- THIS IS THE FIX ---
+    # The box area is (x2 - x1) * (y2 - y1)
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    # --- END OF FIX ---
+
+    union_area = float(box1_area + box2_area - intersection_area)
+
+    if union_area == 0:
+        return 0.0
+
+    return intersection_area / union_area
+# --- *** END OF CORRECTED IOU FUNCTION *** ---
+
+# --- *** MODIFIED HELPER FUNCTION *** ---
+def run_jersey_model_on_crop(model, model_names, crop_img, conf_threshold=0.5):
+    """
+    Runs the jersey model on a cropped player image, assembles digits
+    by their horizontal position, and returns a string (e.g., '17')
+    or None if no valid number is found.
+    """
+    if crop_img is None or crop_img.size == 0:
+        return None
+
+    # Run detection on the crop
+    results = model(crop_img, verbose=False, conf=conf_threshold)
+
+    detected_digits = []  # List to store (x_center, digit_string)
+
+    # --- *** NEW: Define the set of valid digits *** ---
+    # This filters out 'cero', 'n', etc. from your model
+    valid_digits = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9'}
+
+    # results is a list, get the first element
+    if results and results[0].boxes:
+        for box in results[0].boxes:
+            try:
+                # Get the class ID for the detected digit
+                cls_id = int(box.cls[0])
+
+                # Get the digit string (e.g., '7') from the model_names list
+                digit_str = model_names[cls_id]
+
+                # --- *** MODIFICATION: Check if the detected class is a valid digit *** ---
+                if digit_str in valid_digits:
+                    # Get box coordinates to find horizontal position
+                    b = box.xyxy[0].cpu().numpy()  # [x1, y1, x2, y2]
+                    x_center = (b[0] + b[2]) / 2
+
+                    # Store the digit and its position
+                    detected_digits.append((x_center, digit_str))
+                # else:
+                    # Optional: print(f"Ignoring non-digit class '{digit_str}'")
+
+            except Exception as e:
+                print(f"Error parsing digit detection: {e}")
+
+    # If no digits were found, return None
+    if not detected_digits:
+        return None
+
+    # CRITICAL: Sort detected digits by their horizontal position (x_center)
+    # This ensures '1' and '7' become '17', not '71'
+    detected_digits.sort(key=lambda d: d[0])
+
+    # Combine them into a single string
+    jersey_number_str = "".join([digit for x_center, digit in detected_digits])
+
+    return jersey_number_str
+# --- *** END OF MODIFIED FUNCTION *** ---
+
+# --- Load YAML files and Models (Adjust paths as needed) ---
+
+# Model 1: Players, Goalies, Referees, etc.
+# IMPORTANT: Update this path to your file
+with open('/kaggle/input/newwww/data (2).yaml', 'r') as f:
+    data1 = yaml.safe_load(f)
+# IMPORTANT: Update this path to your file
+player_model = YOLO('/kaggle/input/new111/best (1).pt')
+names_model1 = data1['names']
+
+# Model 3: Puck Only
+try:
+    # IMPORTANT: Update this path to your file
+    puck_model = YOLO('/kaggle/input/newpuckkk/SportsVision-YOLO-main/yolov8m_forzasys_hockey_Version_2.pt')
+except Exception as e:
+    print(f"Error loading puck model: {e}")
+    print("Please update the path for the puck detection model. Exiting.")
+    sys.exit()
+
+# *** NEW: Model 4: Jersey Number Recognition ***
+# IMPORTANT: Update these paths to your jersey number model and its YAML file
+jersey_model_path = '/kaggle/input/new111/best (2).pt'
+jersey_yaml_path = '/kaggle/input/newwww/data (1) (1).yaml'
+
+try:
+    jersey_model = YOLO(jersey_model_path)
+    # Load the YAML file to get the class names
+    with open(jersey_yaml_path, 'r') as f:
+        jersey_data = yaml.safe_load(f)
+    jersey_model_names = jersey_data['names']
+
+    print("✅ Successfully loaded jersey recognition model and its class names.")
+    print(f"    Jersey model classes: {jersey_model_names}")
+
+except Exception as e:
+    print(f"⚠ Error loading jersey model or YAML: {e}. Jersey auto-detection will be disabled.")
+    jersey_model = None
+    jersey_model_names = None
+
+# --- 'player' and 'goaltender' classes are targeted for team classification and puck possession ---
+target_classes_for_team = {i for i, n in enumerate(names_model1) if n.lower() in {'player', 'goaltender'}}
+# Get the class ID for 'goaltender'
+goaltender_cls_id = next((i for i, n in enumerate(names_model1) if n.lower() == 'goaltender'), None)
+print(f"ℹ Targeting classes for ID/Team logic: {[names_model1[i] for i in target_classes_for_team]}")
+# Get the class ID for 'goal' to use in goal detection logic
+goal_cls_id = next((i for i, n in enumerate(names_model1) if n.lower() == 'goal'), None)
+if goal_cls_id is None:
+    print("⚠ WARNING: 'goal' class not found in model 1 names. Goal detection will be disabled.")
+
+# --- Get User Inputs (NEW ROSTER LOGIC) ---
+print("Please provide the team rosters. This will be used for team classification.")
+# Pass 1: Get Home roster
+home_roster_set = get_team_roster("Home")
+# Pass 2: Get Away roster, checking against Home for duplicates
+away_roster_set = get_team_roster("Away", existing_roster=home_roster_set)
+
+# *** NEW: Create a combined set of all valid jersey numbers ***
+all_rosters_set = home_roster_set.union(away_roster_set)
+
+# --- Define Colors and Thresholds ---
+HOME_TEAM_BBOX_COLOR, AWAY_TEAM_BBOX_COLOR = (0, 255, 0), (0, 215, 255)  # Green, Yellow
+PASS_EVENT_COLOR = (255, 0, 255)  # Magenta
+SAVE_EVENT_COLOR = (255, 165, 0)  # Orange for Save
+GOAL_EVENT_COLOR = (0, 0, 255)  # Red
+color_map = {
+    'referee': (0, 0, 255),  # Red
+    'puck': (0, 0, 0),  # Black
+    'faceoff': (255, 0, 0),  # Blue
+    'goal': (0, 165, 255),  # Orange
+    'player': (128, 128, 128),  # Grey
+    'goaltender': (128, 128, 128),  # Grey
+    'hockey stick': (200, 200, 200)  # Light Grey
+}
+
+# --- *** NEW: User-defined Thresholds *** ---
+print("\n--- Configure Detection Thresholds ---")
+PUCK_CONF_THRESHOLD = get_user_float(
+    "Enter Puck Confidence Threshold (0.0 to 1.0)",
+    default_value=0.55
+)
+DUPLICATE_IOU_THRESHOLD = get_user_float(
+    "Enter Duplicate Player IoU Threshold (0.0 to 1.0)",
+    default_value=0.5
+)
+# --- *** END of User-defined Thresholds *** ---
+
+# --- Event Detection Thresholds ---
+POSSESSION_PROXIMITY_THRESHOLD = 150  # Max distance in pixels between a player and puck for possession
+PASS_EVENT_DISPLAY_DURATION = 60  # Number of frames to display the "Pass" text
+SAVE_EVENT_DISPLAY_DURATION = 60  # Number of frames to display the "Save" text
+GOAL_EVENT_DISPLAY_DURATION = 150  # Number of frames to display the "Goal" text
+POSSESSION_CONFIRMATION_FRAMES = 3  # *** NEW: Min frames to confirm possession ***
+
+# --- VIDEO SETUP (Adjust paths as needed) ---
+# IMPORTANT: Update this path to your file
+video_path = '/kaggle/input/vdosss/Screen Recording 2025-10-22 233626.mp4'
+output_video_path = 'sput.mp4'
+output_excel_path = 'hockey_events_log.xlsx'  # Define Excel output file name
+
+# IMPORTANT: Update this path to your custom tracker YAML file
+tracker_config_path = '/kaggle/input/yamllll/om_bytetrack.yaml'
+
+cap = cv2.VideoCapture(video_path)
+if not cap.isOpened():
+    print(f"Error: Could not open video file at {video_path}")
+    sys.exit()
+
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 30
+
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
+
+print("Processing video with manual mapping workflow...")
+track_team_memory = {}
+track_class_memory = {}  # NEW: Store the last known class ID for a track_id
+frame_count = 0
+all_player_goaltender_ids_seen = set()  # <-- NEW: Set to store ONLY player/goalie IDs
+
+# --- State variables for event detection ---
+puck_possessor_id = None
+last_puck_possessor_id = None
+last_player_possessor_id = None  # <-- This is now the "shooter of record"
+pass_event_info = None
+save_event_info = None  # NEW: Save event state
+goal_event_info = None
+goal_sequence_active = False  # <-- *** NEW: Prevents duplicate goal logging ***
+event_log = []  # List to store event data for Excel export
+
+# --- *** NEW: Possession Confirmation State *** ---
+possession_counter = {}  # {track_id: consecutive_frames}
+
+# --- Load manual jersey number map ---
+MANUAL_MAP_FILE = '/kaggle/input/1st-video-yaml/manua.yaml'
+track_jn_memory = {}  # Start with an empty map
+is_second_pass = False  # <-- NEW: Default to "Pass 1"
+
+try:
+    with open(MANUAL_MAP_FILE, 'r') as f:
+        manual_map = yaml.safe_load(f)
+    if manual_map:
+        # Convert keys to int and values to string for consistency
+        track_jn_memory = {int(k): str(v) for k, v in manual_map.items()}
+        is_second_pass = True  # <-- NEW: A map was loaded, so this is Pass 2!
+        print(f"✅ Successfully loaded manual map with {len(track_jn_memory)} entries. Running Pass 2 (Production).")
+except FileNotFoundError:
+    print(f"ℹ No manual map file found at '{MANUAL_MAP_FILE}'. Running Pass 1 (Analysis). Jersey model disabled.")
+except Exception as e:
+    print(f"⚠ Error loading manual map: {e}. Running Pass 1 (Analysis). Jersey model disabled.")
+
+# --- MAIN VIDEO PROCESSING LOOP ---
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame_count += 1
+    annotated_frame = frame.copy()
+
+    # --- 1. DETECT PUCK ---
+    puck_position = None
+    puck_bbox = None
+    results_puck = puck_model(frame, verbose=False, conf=PUCK_CONF_THRESHOLD)
+    for r in results_puck:
+        if len(r.boxes.xyxy) > 0:
+            box = r.boxes.xyxy[0]  # Assume one puck
+            px1, py1, px2, py2 = [int(c) for c in box]
+            puck_bbox = [px1, py1, px2, py2]  # Store as [x1, y1, x2, y2]
+            puck_position = (int((px1 + px2) / 2), int((py1 + py2) / 2))
+            puck_color = color_map['puck']
+            cv2.rectangle(annotated_frame, (px1, py1), (px2, py2), puck_color, 2)
+            cv2.putText(annotated_frame, "Puck", (px1, py1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, puck_color, 2)
+
+    # --- 2. DETECT AND TRACK EVERYTHING ---
+    results1 = player_model.track(frame,
+                                  persist=True,
+                                  conf=0.3,
+                                  verbose=False,
+                                  tracker=tracker_config_path)
+
+    filtered_boxes, filtered_classes, filtered_track_ids = np.array([]), np.array([]), np.array([])
+    current_player_classes = {}  # NEW: {track_id: cls_id} for current frame
+
+    if results1[0].boxes is not None and results1[0].boxes.id is not None:
+        boxes = results1[0].boxes.xyxy.cpu().numpy()
+        classes = results1[0].boxes.cls.cpu().numpy()
+        track_ids = results1[0].boxes.id.cpu().numpy()
+
+        # --- REMOVE DUPLICATE BOUNDING BOXES (NMS-like) ---
+        non_duplicate_indices = []
+        is_suppressed = [False] * len(boxes)
+        for i in range(len(boxes)):
+            if is_suppressed[i]:
+                continue
+            non_duplicate_indices.append(i)
+            for j in range(i + 1, len(boxes)):
+                if is_suppressed[j]:
+                    continue
+                # Compare same class and high IoU
+                if classes[i] == classes[j] and iou(boxes[i], boxes[j]) > DUPLICATE_IOU_THRESHOLD:
+                    is_suppressed[j] = True
+
+        filtered_boxes = boxes[non_duplicate_indices]
+        filtered_classes = classes[non_duplicate_indices]
+        filtered_track_ids = track_ids[non_duplicate_indices]
+
+        # --- 3. EVENT DETECTION LOGIC (Players/Goalies Only) ---
+        current_puck_possessor_id = None
+        current_goal_boxes = []
+
+        # Populate current_player_classes and all_player_goaltender_ids_seen
+        for i, box in enumerate(filtered_boxes):
+            cls_id = int(filtered_classes[i])
+            track_id = int(filtered_track_ids[i])
+
+            if cls_id in target_classes_for_team:
+                all_player_goaltender_ids_seen.add(track_id)
+                current_player_classes[track_id] = cls_id
+                track_class_memory[track_id] = cls_id  # Update class memory
+
+            if goal_cls_id is not None and cls_id == goal_cls_id:
+                current_goal_boxes.append([int(c) for c in box])
+
+        if puck_position:
+            min_dist = float('inf')
+            closest_player_id = None
+
+            for i, box in enumerate(filtered_boxes):
+                cls_id = int(filtered_classes[i])
+                track_id = int(filtered_track_ids[i])
+                x1, y1, x2, y2 = [int(c) for c in box]
+
+                # A. Possession Check (Players/Goalies Only)
+                if cls_id in target_classes_for_team:
+                    player_center_bottom = (int((x1 + x2) / 2), y2)
+                    dist = math.sqrt((player_center_bottom[0] - puck_position[0])**2 + (player_center_bottom[1] - puck_position[1])**2)
+
+                    if dist < min_dist:
+                        min_dist = dist
+                        closest_player_id = track_id
+
+            if min_dist < POSSESSION_PROXIMITY_THRESHOLD:
+                current_puck_possessor_id = closest_player_id
+
+            # --- *** NEW: Possession Confirmation Logic *** ---
+            # Reset counters for all players *not* currently possessing
+            player_ids_to_reset = set(possession_counter.keys()) - {current_puck_possessor_id}
+            for track_id in player_ids_to_reset:
+                possession_counter[track_id] = 0
+
+            if current_puck_possessor_id is not None:
+                # Increment counter for the current possessor
+                current_frames = possession_counter.get(current_puck_possessor_id, 0)
+                possession_counter[current_puck_possessor_id] = current_frames + 1
+
+                # Check if this is a "confirmed" possession
+                if possession_counter[current_puck_possessor_id] == POSSESSION_CONFIRMATION_FRAMES:
+                    # This is a confirmed new possession.
+                    # Get the class (Player or Goalie)
+                    possessor_cls = current_player_classes.get(current_puck_possessor_id, None)
+                    if possessor_cls != goaltender_cls_id:
+                        # This is a Player, update the "shooter of record"
+                        last_player_possessor_id = current_puck_possessor_id
+                        print(f"ℹ Info: Confirmed possession by Player #{last_player_possessor_id}")
+
+            # --- Pass/Save Event Logic ---
+            # Triggered when puck possession changes (on the *first* frame of change)
+            if current_puck_possessor_id is not None and last_puck_possessor_id is not None and current_puck_possessor_id != last_puck_possessor_id:
+
+                from_jn = track_jn_memory.get(last_puck_possessor_id, "N/A")
+                to_jn = track_jn_memory.get(current_puck_possessor_id, "N/A")
+
+                # Determine if the receiver is a goaltender
+                receiver_is_goaltender = current_player_classes.get(current_puck_possessor_id) == goaltender_cls_id
+
+                if receiver_is_goaltender:
+                    if not goal_sequence_active:
+                        is_in_goal_area = False
+                        goaltender_box = None
+                        try:
+                            gt_index = np.where(filtered_track_ids == current_puck_possessor_id)[0][0]
+                            goaltender_box = filtered_boxes[gt_index]
+                        except IndexError:
+                            goaltender_box = None
+
+                        if goaltender_box is not None and current_goal_boxes:
+                            for goal_box in current_goal_boxes:
+                                if iou(goaltender_box, goal_box) > 0:
+                                    is_in_goal_area = True
+                                    break
+
+                        if is_in_goal_area:
+                            save_event_info = {
+                                'shooter_id': last_puck_possessor_id,
+                                'goaltender_id': current_puck_possessor_id,
+                                'shooter_jn': from_jn,
+                                'goaltender_jn': to_jn,
+                                'display_frames': SAVE_EVENT_DISPLAY_DURATION
+                            }
+                            timestamp = frame_count / fps
+                            event_data = {
+                                'Frame': frame_count,
+                                'Timestamp (s)': f"{timestamp:.2f}",
+                                'Event': 'Save',
+                                'From Player ID': last_puck_possessor_id,
+                                'From JN': from_jn,
+                                'To Player ID': current_puck_possessor_id,
+                                'To JN': to_jn,
+                                'Details': f"Save by Goaltender #{current_puck_possessor_id} (JN: {to_jn}) on shot by Player #{last_puck_possessor_id} (JN: {from_jn})"
+                            }
+                            event_log.append(event_data)
+                            print(f"✋ SAVE DETECTED (in goal): Frame {frame_count}. Goaltender JN:{to_jn} saved shot from Player JN:{from_jn}")
+                            pass_event_info = None
+
+                        else:
+                            if goaltender_box is not None:
+                                print(f"ℹ Info: Goaltender {current_puck_possessor_id} (JN:{to_jn}) gained possession outside goal. Not a 'Save'.")
+
+                else:
+                    # *PASS EVENT*
+                    pass_event_info = {
+                        'from': last_puck_possessor_id,
+                        'to': current_puck_possessor_id,
+                        'from_jn': from_jn,
+                        'to_jn': to_jn,
+                        'display_frames': PASS_EVENT_DISPLAY_DURATION
+                    }
+                    timestamp = frame_count / fps
+                    event_data = {
+                        'Frame': frame_count,
+                        'Timestamp (s)': f"{timestamp:.2f}",
+                        'Event': 'Pass',
+                        'From Player ID': last_puck_possessor_id,
+                        'From JN': from_jn,
+                        'To Player ID': current_puck_possessor_id,
+                        'To JN': to_jn,
+                        'Details': f"Pass from Player #{last_puck_possessor_id} (JN: {from_jn}) to Player #{current_puck_possessor_id} (JN: {to_jn})"
+                    }
+                    event_log.append(event_data)
+                    save_event_info = None
+
+            # --- Goal Event Trigger Logic (INSTANT) ---
+            puck_in_goal = False
+            if puck_bbox is not None and current_goal_boxes:
+                for goal_box in current_goal_boxes:
+                    if iou(puck_bbox, goal_box) > 0:
+                        puck_in_goal = True
+                        break
+
+            # Check who has possession *right now*
+            possessor_cls = current_player_classes.get(current_puck_possessor_id, None)
+
+            # *** THE SHOOTER IS THE LAST *CONFIRMED* PLAYER POSSESSOR ***
+            shooter_id = last_player_possessor_id
+
+            if (puck_in_goal and
+                    not goal_sequence_active and
+                    goal_event_info is None and
+                    possessor_cls != goaltender_cls_id and
+                    shooter_id is not None):
+
+                shooter_jn = track_jn_memory.get(shooter_id, "N/A")
+
+                goal_event_info = {
+                    'shooter_id': shooter_id,
+                    'shooter_jn': shooter_jn,
+                    'display_frames': GOAL_EVENT_DISPLAY_DURATION
+                }
+
+                timestamp = frame_count / fps
+                event_data = {
+                    'Frame': frame_count,
+                    'Timestamp (s)': f"{timestamp:.2f}",
+                    'Event': 'Goal',
+                    'From Player ID': shooter_id,
+                    'From JN': shooter_jn,
+                    'To Player ID': 'N/A',
+                    'To JN': 'N/A',
+                    'Details': f"Goal scored by Player #{shooter_id} (JN: {shooter_jn})"
+                }
+                event_log.append(event_data)
+
+                # --- *** MODIFIED: Rebound/Trickle-in Logic *** ---
+                goal_frame = frame_count
+                goal_shooter_id = event_data['From Player ID']
+                override_window_frames = fps * 2  # 2.0 seconds
+
+                indices_to_remove = []
+                for i in range(len(event_log) - 2, -1, -1):
+                    event = event_log[i]
+
+                    if (goal_frame - event['Frame']) >= override_window_frames:
+                        break
+
+                    if event['Event'] == 'Save':
+                        save_shooter_id = event['From Player ID']
+
+                        # Only override if the shooter is the SAME person
+                        if save_shooter_id == goal_shooter_id:
+                            print(f"ℹ Info: Goal on frame {goal_frame} by Player #{goal_shooter_id} overrides Save from frame {event['Frame']} (same shooter, trickle-in goal).")
+                            indices_to_remove.append(i)
+                        else:
+                            print(f"ℹ Info: Keeping Save from {event['Frame']} (Shooter: {save_shooter_id}). Rebound goal by {goal_shooter_id}.")
+
+                for i in sorted(indices_to_remove, reverse=True):
+                    event_log.pop(i)
+                # --- *** END OF NEW LOGIC *** ---
+
+                save_event_info = None
+                pass_event_info = None
+
+                print(f"🥅 GOAL DETECTED: Frame {frame_count} by Player #{shooter_id} (JN: {shooter_jn})")
+
+                goal_sequence_active = True
+
+            # --- *** NEW: Goal Sequence Reset Logic *** ---
+            if not puck_in_goal:
+                goal_sequence_active = False
+
+            # --- *** MODIFIED: State Update Logic *** ---
+            # We only update last_puck_possessor_id for the *next* frame's logic
+            # last_player_possessor_id is now updated *only* by the confirmation logic
+            puck_possessor_id = current_puck_possessor_id
+            if puck_possessor_id is not None:
+                last_puck_possessor_id = puck_possessor_id
+
+        # --- 4. DRAW DETECTIONS AND EVENTS ---
+        for i, box in enumerate(filtered_boxes):
+            track_id = int(filtered_track_ids[i])
+            x1, y1, x2, y2 = [int(c) for c in box]
+            cls_id = int(filtered_classes[i])
+            original_label_name = names_model1[cls_id]
+
+            color = color_map.get(original_label_name.lower(), (255, 255, 255))
+
+            if cls_id in target_classes_for_team:
+                jersey_number_str = track_jn_memory.get(track_id, "")
+                team_label = track_team_memory.get(track_id, "Undetermined")
+
+                if (is_second_pass and
+                        team_label == "Undetermined" and
+                        not jersey_number_str and
+                        jersey_model is not None and
+                        jersey_model_names is not None):
+
+                    try:
+                        player_crop = frame[y1:y2, x1:x2]
+                        predicted_jn = run_jersey_model_on_crop(jersey_model, jersey_model_names, player_crop)
+
+                        if predicted_jn:
+                            existing_jns = set(track_jn_memory.values())
+
+                            if predicted_jn in existing_jns:
+                                new_jn = f"{predicted_jn}A"
+                                if new_jn in all_rosters_set and new_jn not in existing_jns:
+                                    print(f"ℹ Jersey model predicted '{predicted_jn}' (ID: {track_id}), but it's a duplicate. Locking as '{new_jn}'.")
+                                    predicted_jn = new_jn
+                                else:
+                                    print(f"⚠ Jersey model predicted '{predicted_jn}' (ID: {track_id}), but it's a duplicate and '{new_jn}' is unavailable. Ignoring.")
+                                    predicted_jn = None
+
+                            elif predicted_jn not in all_rosters_set:
+                                print(f"⚠ Jersey model predicted '{predicted_jn}' (ID: {track_id}), but this JN is not in the home or away roster. Ignoring.")
+                                predicted_jn = None
+
+                            if predicted_jn:
+                                track_jn_memory[track_id] = predicted_jn
+                                jersey_number_str = predicted_jn
+                                print(f"✅ Jersey model locked JN '{predicted_jn}' for Track ID: {track_id}")
+
+                    except Exception as e:
+                        print(f"Error running jersey model on track_id {track_id}: {e}")
+
+                if team_label == "Undetermined" and jersey_number_str:
+                    if jersey_number_str in home_roster_set:
+                        team_label = "Home"
+                    elif jersey_number_str in away_roster_set:
+                        team_label = "Away"
+
+                    if team_label != "Undetermined":
+                        track_team_memory[track_id] = team_label
+
+                if team_label == "Home":
+                    color = HOME_TEAM_BBOX_COLOR
+                elif team_label == "Away":
+                    color = AWAY_TEAM_BBOX_COLOR
+
+                if team_label == "Home":
+                    team_prefix = "P:H"
+                elif team_label == "Away":
+                    team_prefix = "P:A"
+                else:
+                    team_prefix = "P"
+
+                final_label = f"{team_prefix} #{track_id}"
+                if jersey_number_str:
+                    final_label += f" (JN: {jersey_number_str})"
+
+                # *** MODIFIED: Show possession from "current" id, not confirmed id ***
+                if track_id == current_puck_possessor_id:
+                    final_label += " (w/ Puck)"
+
+            else:
+                final_label = original_label_name.capitalize()
+
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(annotated_frame, final_label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    # Draw the Pass Event text on screen
+    if pass_event_info and pass_event_info['display_frames'] > 0:
+        pass_text = f"PASS: From JN:{pass_event_info['from_jn']} (#{pass_event_info['from']}) to JN:{pass_event_info['to_jn']} (#{pass_event_info['to']})"
+        text_size = cv2.getTextSize(pass_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0]
+        text_x = (frame_width - text_size[0]) // 2
+        cv2.putText(annotated_frame, pass_text, (text_x, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, PASS_EVENT_COLOR, 2, cv2.LINE_AA)
+        pass_event_info['display_frames'] -= 1
+        if pass_event_info['display_frames'] == 0:
+            pass_event_info = None
+
+    # Draw the Save Event text on screen
+    if save_event_info and save_event_info['display_frames'] > 0:
+        save_text = f"🧤 SAVE! Shooter JN:{save_event_info['shooter_jn']} | Goaltender JN:{save_event_info['goaltender_jn']}"
+        text_size = cv2.getTextSize(save_text, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0]
+        text_x = (frame_width - text_size[0]) // 2
+        cv2.putText(annotated_frame, save_text, (text_x, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, SAVE_EVENT_COLOR, 2, cv2.LINE_AA)
+        save_event_info['display_frames'] -= 1
+        if save_event_info['display_frames'] == 0:
+            save_event_info = None
+
+    # Draw the Goal Event text on screen
+    if goal_event_info and goal_event_info['display_frames'] > 0:
+        goal_text = f"🚨 GOAL! 🥅 Shooter JN:{goal_event_info['shooter_jn']} (#{goal_event_info['shooter_id']})"
+        text_size = cv2.getTextSize(goal_text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
+        text_x = (frame_width - text_size[0]) // 2
+        cv2.rectangle(annotated_frame, (text_x - 10, 80 - text_size[1] - 10), (text_x + text_size[0] + 10, 80 + 10), (0, 0, 0), -1)
+        cv2.putText(annotated_frame, goal_text, (text_x, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.5, GOAL_EVENT_COLOR, 3, cv2.LINE_AA)
+        goal_event_info['display_frames'] -= 1
+        if goal_event_info['display_frames'] == 0:
+            goal_event_info = None
+
+    out.write(annotated_frame)
+
+# --- SAVE EVENT LOG TO EXCEL ---
+if event_log:
+    print(f"\nSaving event log to Excel file at {output_excel_path}...")
+    df = pd.DataFrame(event_log)
+    cols = ['Frame', 'Timestamp (s)', 'Event', 'From Player ID', 'From JN', 'To Player ID', 'To JN', 'Details']
+    for col in cols:
+        if col not in df.columns:
+            df[col] = pd.NA
+    df = df[cols] 
+    df.to_excel(output_excel_path, index=False)
+    print("✅ Event log saved successfully.")
+else:
+    print("\nNo pass, save, or goal events were detected to log.")
+
+# --- MODIFICATION 2: Generate a complete YAML template ---
+print("\n--- Tracking Analysis & YAML Template ---")
+if all_player_goaltender_ids_seen:
+    print(f"✅ Found a total of {len(all_player_goaltender_ids_seen)} unique player/goaltender Track IDs.")
+
+    print(f"\n--- Copy-paste this template into '{MANUAL_MAP_FILE}' and fill it out ---")
+    print("# manual_jn_map.yaml") 
+    print("# --------------------------------------------------")
+
+    for track_id in sorted(list(all_player_goaltender_ids_seen)):
+        print(f"{track_id}: '' # Unmapped. e.g., '17' or '44A'")
+
+    print("# --------------------------------------------------")
+    print(f"\nAfter filling, save the file as 'manual_jn_map.yaml' and re-run for Pass 2 (Production).")
+
+else:
+    print("⚠ No players or goaltenders were tracked in this video.")
+
+# --- CLEANUP --- 
+cap.release()
+out.release()
+cv2.destroyAllWindows()
+print(f"\n✅ Video processing complete. Output saved to {output_video_path}")

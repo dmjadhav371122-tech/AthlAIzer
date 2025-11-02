@@ -1,0 +1,11 @@
+names:
+- centerIce
+- faceoff
+- goal
+- goaltender
+- player
+- puck
+- referee
+nc: 7
+train: D:/AthALizer/HockeyAI_YOLO/images/train
+val: D:/AthALizer/HockeyAI_YOLO/images/val
