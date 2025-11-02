@@ -32,7 +32,7 @@ jobs:
       
       - name: Build project
         # This is where it uses your secrets!
-        run: npm run build -- --base=/AthlAIzer/
+        run: npm run build -- --base /AthlAIzer/
         env:
           VITE_BOLT_DATABASE_URL: ${{ secrets.VITE_BOLT_DATABASE_URL }}
           VITE_BOLT_DATABASE_ANON_KEY: ${{ secrets.VITE_BOLT_DATABASE_ANON_KEY }}
